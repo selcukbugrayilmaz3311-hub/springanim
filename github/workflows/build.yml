@@ -1,0 +1,196 @@
+name: Build SpringMod
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project
+        run: |
+          mkdir -p proj && cd proj
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'SpringMod'
+          include ':app', ':xposedstub'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
+          mkdir -p xposedstub/src/main/java/de/robv/android/xposed/callbacks
+          cat > xposedstub/build.gradle <<'EOF'
+          plugins { id 'java-library' }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF
+          cat > xposedstub/src/main/java/de/robv/android/xposed/IXposedHookLoadPackage.java <<'EOF'
+          package de.robv.android.xposed;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable;
+          }
+          EOF
+          cat > xposedstub/src/main/java/de/robv/android/xposed/callbacks/XC_LoadPackage.java <<'EOF'
+          package de.robv.android.xposed.callbacks;
+          public abstract class XC_LoadPackage {
+              public static final class LoadPackageParam {
+                  public String packageName;
+                  public String processName;
+                  public ClassLoader classLoader;
+                  public boolean isFirstApplication;
+              }
+          }
+          EOF
+          cat > xposedstub/src/main/java/de/robv/android/xposed/XC_MethodHook.java <<'EOF'
+          package de.robv.android.xposed;
+          public abstract class XC_MethodHook {
+              public XC_MethodHook() {}
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
+              public static class MethodHookParam {
+                  public Object thisObject;
+                  public Object[] args;
+              }
+              public class Unhook {}
+          }
+          EOF
+          cat > xposedstub/src/main/java/de/robv/android/xposed/XposedBridge.java <<'EOF'
+          package de.robv.android.xposed;
+          import java.util.Set;
+          public final class XposedBridge {
+              public static void log(String text) {}
+              public static Set<XC_MethodHook.Unhook> hookAllConstructors(Class<?> hookClass, XC_MethodHook callback) { return null; }
+          }
+          EOF
+          mkdir -p app/src/main/java/dev/springmod app/src/main/assets app/src/main/res/values
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'dev.springmod'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'dev.springmod.launcher'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies { compileOnly project(':xposedstub') }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="SpringMod" android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Launcher uygulama acma/kapama spring ayari" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>com.mi.android.globallauncher</item>
+                  <item>com.miui.home</item>
+              </string-array>
+          </resources>
+          EOF
+          echo "dev.springmod.Hook" > app/src/main/assets/xposed_init
+          cat > app/src/main/java/dev/springmod/Hook.java <<'EOF'
+          package dev.springmod;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+          import java.lang.reflect.Method;
+          import java.util.HashSet;
+          import java.util.Set;
+
+          public class Hook implements IXposedHookLoadPackage {
+              private static final String TARGET =
+                      "com.miui.home.recents.util.SpringParamsProvider$SpringParam";
+              // Baslangic carpanlari. Telefonda su komutlarla canli degistirilebilir:
+              //   su -c "setprop debug.spr.damp 0.8"
+              //   su -c "setprop debug.spr.resp 0.9"
+              //   su -c "setprop debug.spr.on 0"   (modulu devre disi birakir)
+              private static final float DEF_DAMP = 0.85f;
+              private static final float DEF_RESP = 0.90f;
+              private static final Set<String> SEEN = new HashSet<>();
+
+              private static float prop(String name, float def) {
+                  try {
+                      Class<?> sp = Class.forName("android.os.SystemProperties");
+                      Method m = sp.getMethod("get", String.class, String.class);
+                      String s = (String) m.invoke(null, name, "");
+                      if (s == null || s.isEmpty()) return def;
+                      return Float.parseFloat(s.trim());
+                  } catch (Throwable t) {
+                      return def;
+                  }
+              }
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+                  String p = lpparam.packageName;
+                  if (!"com.mi.android.globallauncher".equals(p) && !"com.miui.home".equals(p)) return;
+                  try {
+                      Class<?> c = Class.forName(TARGET, false, lpparam.classLoader);
+                      XposedBridge.hookAllConstructors(c, new XC_MethodHook() {
+                          @Override
+                          protected void beforeHookedMethod(MethodHookParam param) {
+                              try {
+                                  Object[] a = param.args;
+                                  if (a == null || a.length != 4 || !(a[0] instanceof String)) return;
+                                  String key = (String) a[0];
+                                  float damping = ((Float) a[1]).floatValue();
+                                  float response = ((Float) a[2]).floatValue();
+                                  float impulse = ((Float) a[3]).floatValue();
+                                  synchronized (SEEN) {
+                                      if (SEEN.add(key)) {
+                                          XposedBridge.log("SpringMod: key=" + key + " damping=" + damping
+                                                  + " response=" + response + " impulse=" + impulse);
+                                      }
+                                  }
+                                  if (prop("debug.spr.on", 1f) == 0f) return;
+                                  float dm = prop("debug.spr.damp", DEF_DAMP);
+                                  float rm = prop("debug.spr.resp", DEF_RESP);
+                                  if (dm > 0f) a[1] = Float.valueOf(damping * dm);
+                                  if (rm > 0f) a[2] = Float.valueOf(response * rm);
+                              } catch (Throwable t) {
+                                  XposedBridge.log("SpringMod: hata " + t);
+                              }
+                          }
+                      });
+                      XposedBridge.log("SpringMod: hook kuruldu (" + p + ")");
+                  } catch (Throwable t) {
+                      XposedBridge.log("SpringMod: hook kurulamadi (" + p + "): " + t);
+                  }
+              }
+          }
+          EOF
+      - name: Build
+        working-directory: proj
+        run: gradle :app:assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpringMod
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
